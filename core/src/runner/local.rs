@@ -136,12 +136,15 @@ impl LocalRunner {
         // failure is localised here instead of arriving with no location.
         .map_err(|err| err.with_invocation(Some(contract_id), Some(called_function.as_str())))?;
 
+        let cost_stroops = estimate_cost_stroops(&resources);
+        let fee_config = crate::fee_quote::SorobanFeeConfig::checked_in();
+
         Ok(SimulationResult {
             bytes_by_durability: crate::simulation::BytesByDurability::from_aggregates_as_other(
                 resources.ledger_read_bytes,
                 resources.ledger_write_bytes,
             ),
-            cost_stroops: estimate_cost_stroops(&resources),
+            cost_stroops,
             rent_bytes: None,
             resources,
             auth_tree: Default::default(),
@@ -153,6 +156,8 @@ impl LocalRunner {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
+            cost_breakdown: None,
+            limit_headroom: None,
         })
     }
 }
@@ -310,7 +315,8 @@ mod tests {
             ledger_read_bytes: 2_048,
             ledger_write_bytes: 1_024,
             transaction_size_bytes: 512,
-        };
+                    ..Default::default()
+};
         // Same shape as SimulationEngine::calculate_cost:
         // 100_000/10_000 + 8_192/1_024 + (2_048+1_024)/1_024 = 10 + 8 + 3 = 21.
         assert_eq!(super::estimate_cost_stroops(&resources), 21);

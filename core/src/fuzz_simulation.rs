@@ -39,7 +39,8 @@ mod tests {
                 ledger_read_bytes: lr,
                 ledger_write_bytes: lw,
                 transaction_size_bytes: tx,
-            })
+                            ..Default::default()
+})
     }
 
     /// Arbitrary `TtlEntryReport`.
@@ -61,6 +62,14 @@ mod tests {
             contract_id: cid,
             function: func,
             children: vec![],
+            cpu_instructions: None,
+            ram_bytes: None,
+            ledger_read_bytes: None,
+            ledger_write_bytes: None,
+            exclusive_cpu_instructions: None,
+            exclusive_ram_bytes: None,
+            exclusive_ledger_read_bytes: None,
+            exclusive_ledger_write_bytes: None,
         });
 
         leaf.prop_recursive(3, 15, 4, |inner| {
@@ -73,6 +82,14 @@ mod tests {
                     contract_id: cid,
                     function: func,
                     children: kids,
+                    cpu_instructions: None,
+                    ram_bytes: None,
+                    ledger_read_bytes: None,
+                    ledger_write_bytes: None,
+                    exclusive_cpu_instructions: None,
+                    exclusive_ram_bytes: None,
+                    exclusive_ledger_read_bytes: None,
+                    exclusive_ledger_write_bytes: None,
                 })
         })
     }
@@ -102,6 +119,7 @@ mod tests {
                 call_graph: None,
                 state_snapshot: None,
                 protocol_version: 0,
+                fee_calibration: Default::default(),
             })
     }
 
@@ -452,7 +470,10 @@ mod tests {
         /// Must never panic on arbitrary call trees; output starts correctly.
         #[test]
         fn fuzz_call_graph_to_mermaid(root in arb_call_node()) {
-            let graph = CallGraph { root };
+            let graph = CallGraph {
+                root,
+                incomplete: false,
+            };
             let mermaid = graph.to_mermaid();
             prop_assert!(mermaid.starts_with("graph TD\n"));
             prop_assert!(!mermaid.is_empty());

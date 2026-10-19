@@ -6,14 +6,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
-    AccountId, DiagnosticEvent, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
-    HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey,
-    LedgerKeyContractCode, LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScMapEntry, ScSymbol, ScVal,
-    SequenceNumber, SorobanAddressCredentials, SorobanAuthorizationEntry,
-    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
-    SorobanTransactionData, Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM,
-    WriteXdr,
+    AccountId, ContractDataDurability, DiagnosticEvent, ExtensionPoint, Hash, HashIdPreimage,
+    HashIdPreimageSorobanAuthorization, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+    LedgerEntry, LedgerFootprint, LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Limits,
+    Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress,
+    ScMapEntry, ScSymbol, ScVal, SequenceNumber, SorobanAddressCredentials,
+    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+    SorobanCredentials, SorobanTransactionData, Transaction, TransactionExt, TransactionV1Envelope,
+    Uint256, VecM, WriteXdr,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,11 +104,7 @@ impl SimulationError {
     /// Only `ExecutionFailed` carries a location; every other variant already
     /// names its own cause, and leaving them untouched keeps `is_retriable`
     /// and the error text exactly as they were.
-    pub fn with_invocation(
-        mut self,
-        contract_id: Option<String>,
-        function: Option<&str>,
-    ) -> Self {
+    pub fn with_invocation(mut self, contract_id: Option<String>, function: Option<&str>) -> Self {
         if let SimulationError::ExecutionFailed(failure) = &mut self {
             *failure = failure.clone().with_invocation(contract_id, function);
         }
@@ -127,7 +123,9 @@ impl SimulationError {
 /// overrun or a panic.
 impl From<soroban_env_host::HostError> for SimulationError {
     fn from(e: soroban_env_host::HostError) -> Self {
-        SimulationError::ExecutionFailed(crate::failure::ExecutionFailure::from_diagnostic(format!("{e:?}")))
+        SimulationError::ExecutionFailed(crate::failure::ExecutionFailure::from_diagnostic(
+            format!("{e:?}"),
+        ))
     }
 }
 
@@ -171,7 +169,8 @@ pub fn analyze_ledger_access_trace(entries: &[LedgerAccessEntry]) -> LedgerAcces
     }
 
     let mut key_order: Vec<String> = Vec::new();
-    let mut key_map: std::collections::HashMap<String, KeyAccessAnalysis> = std::collections::HashMap::new();
+    let mut key_map: std::collections::HashMap<String, KeyAccessAnalysis> =
+        std::collections::HashMap::new();
 
     for entry in entries {
         if !key_map.contains_key(&entry.key) {
@@ -236,6 +235,10 @@ pub struct SorobanResources {
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
     pub transaction_size_bytes: u64,
+    /// Total XDR bytes carried by the events this invocation emitted.
+    /// Optional because only the call-trace parser measures it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_xdr_bytes: Option<u64>,
     /// Concentrated AMM tick crossing profile report
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amm_tick_profile_report: Option<ConcentratedAmmTickProfileReport>,
@@ -243,6 +246,8 @@ pub struct SorobanResources {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
 pub struct DurabilityByteCounts {
+    #[serde(default)]
+    pub entries: u64,
     pub code: u64,
     pub instance: u64,
     pub persistent: u64,
@@ -260,6 +265,7 @@ impl DurabilityByteCounts {
     }
 
     pub(crate) fn add(&mut self, kind: LedgerKeyKind, bytes: u64) {
+        self.entries = self.entries.saturating_add(1);
         let bucket = match kind {
             LedgerKeyKind::Code => &mut self.code,
             LedgerKeyKind::Instance => &mut self.instance,
@@ -285,12 +291,12 @@ impl BytesByDurability {
     pub fn from_aggregates_as_other(ledger_read_bytes: u64, ledger_write_bytes: u64) -> Self {
         Self {
             read: DurabilityByteCounts {
+                entries: 0,
                 other: ledger_read_bytes,
-                ..Default::default()
             },
             write: DurabilityByteCounts {
+                entries: 0,
                 other: ledger_write_bytes,
-                ..Default::default()
             },
         }
     }
@@ -351,6 +357,8 @@ pub fn classify_ledger_key_xdr(key_xdr: &[u8]) -> LedgerKeyKind {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct NetworkLimits {
     pub max_cpu_instructions: u64,
+    #[serde(default = "default_max_memory_bytes")]
+    pub max_memory_bytes: u64,
     pub max_read_entries: u32,
     pub max_write_entries: u32,
     #[serde(default = "default_max_transaction_size_bytes")]
@@ -367,16 +375,137 @@ fn default_max_entry_size_bytes() -> u64 {
     64 * 1024
 }
 
+fn default_max_memory_bytes() -> u64 {
+    40 * 1024 * 1024
+}
+
 impl Default for NetworkLimits {
     fn default() -> Self {
         Self {
             max_cpu_instructions: 100_000_000,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 40,
             max_write_entries: 20,
             max_transaction_size_bytes: default_max_transaction_size_bytes(),
             max_entry_size_bytes: default_max_entry_size_bytes(),
         }
     }
+}
+
+/// Where a set of `NetworkLimits` came from.
+///
+/// Offline analysis uses a checked-in builtin table (protocol-20 testnet
+/// defaults); online analysis can override from RPC. The source is recorded
+/// on every headroom report so consumers can tell which table applied.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub enum LimitsSource {
+    /// Checked-in protocol defaults (no RPC round-trip).
+    Builtin,
+    /// Limits fetched from an RPC node.
+    Rpc,
+}
+
+/// Per-dimension usage against a network limit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct DimensionHeadroom {
+    pub used: u64,
+    pub limit: u64,
+    /// `used / limit * 100`, clamped at 100 when over.
+    pub percent_used: u32,
+    /// `100 - percent_used`, floored at 0 when over.
+    pub percent_remaining: u32,
+}
+
+/// Usage vs limit for every dimension the issue tracks.
+///
+/// Entry counts come from the transaction footprint (not byte sizes); CPU,
+/// memory and transaction size use the measured resource values.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct LimitHeadroom {
+    pub cpu_instructions: DimensionHeadroom,
+    pub memory_bytes: DimensionHeadroom,
+    pub read_entries: DimensionHeadroom,
+    pub write_entries: DimensionHeadroom,
+    pub transaction_size_bytes: DimensionHeadroom,
+    /// Which table produced the limits.
+    pub limits_source: LimitsSource,
+}
+
+fn dimension_headroom(used: u64, limit: u64) -> DimensionHeadroom {
+    let percent_used = if limit == 0 {
+        if used == 0 {
+            0
+        } else {
+            100
+        }
+    } else {
+        let pct = (used as f64 / limit as f64 * 100.0).round();
+        pct.clamp(0.0, 100.0) as u32
+    };
+    DimensionHeadroom {
+        used,
+        limit,
+        percent_used,
+        percent_remaining: 100u32.saturating_sub(percent_used),
+    }
+}
+
+/// Footprint entry counts decoded from `SorobanTransactionData` XDR.
+///
+/// Returns `(read_entries, write_entries)` where read counts every key in the
+/// footprint and write counts only `readWrite` keys (the entries that may be
+/// mutated). Returns `(0, 0)` when the XDR cannot be decoded.
+pub fn extract_footprint_entry_counts(transaction_data: &str) -> (u32, u32) {
+    let Ok(bytes) = BASE64.decode(transaction_data) else {
+        return (0, 0);
+    };
+    let Ok(data) = SorobanTransactionData::from_xdr(&bytes, Limits::none()) else {
+        return (0, 0);
+    };
+    let read_only = data.resources.footprint.read_only.len() as u32;
+    let read_write = data.resources.footprint.read_write.len() as u32;
+    let read_entries = read_only.saturating_add(read_write);
+    (read_entries, read_write)
+}
+
+/// Build a `LimitHeadroom` report from measured resources and (optionally)
+/// footprint-derived entry counts.
+///
+/// When `footprint_counts` is `None`, entry dimensions are left at zero so
+/// callers that have no transaction data still get CPU/memory/tx headroom.
+pub fn compute_limit_headroom(
+    resources: &SorobanResources,
+    footprint_counts: Option<(u32, u32)>,
+    limits: &NetworkLimits,
+    source: LimitsSource,
+) -> LimitHeadroom {
+    let (read_entries, write_entries) = footprint_counts.unwrap_or((0, 0));
+    LimitHeadroom {
+        cpu_instructions: dimension_headroom(resources.cpu_instructions, limits.max_cpu_instructions),
+        memory_bytes: dimension_headroom(resources.ram_bytes, limits.max_memory_bytes),
+        read_entries: dimension_headroom(u64::from(read_entries), u64::from(limits.max_read_entries)),
+        write_entries: dimension_headroom(u64::from(write_entries), u64::from(limits.max_write_entries)),
+        transaction_size_bytes: dimension_headroom(
+            resources.transaction_size_bytes,
+            limits.max_transaction_size_bytes,
+        ),
+        limits_source: source,
+    }
+}
+
+/// First dimension whose usage is at or over `threshold` percent, in the
+/// issue's fixed order (CPU, memory, read entries, write entries, tx size).
+pub fn first_dimension_at_or_above(headroom: &LimitHeadroom, threshold: u32) -> Option<&'static str> {
+    let dims: [(&'static str, u32); 5] = [
+        ("cpu_instructions", headroom.cpu_instructions.percent_used),
+        ("memory_bytes", headroom.memory_bytes.percent_used),
+        ("read_entries", headroom.read_entries.percent_used),
+        ("write_entries", headroom.write_entries.percent_used),
+        ("transaction_size_bytes", headroom.transaction_size_bytes.percent_used),
+    ];
+    dims.into_iter()
+        .find(|(_, pct)| *pct >= threshold)
+        .map(|(name, _)| name)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -418,7 +547,10 @@ pub fn profile_concentrated_amm_ticks(
         if measurements_raw[i].2 < measurements_raw[i - 1].2 {
             return Err(format!(
                 "Non-monotonic read entries detected: step {} had {} reads < step {} with {} reads",
-                i, measurements_raw[i].2, i - 1, measurements_raw[i - 1].2
+                i,
+                measurements_raw[i].2,
+                i - 1,
+                measurements_raw[i - 1].2
             ));
         }
     }
@@ -432,9 +564,9 @@ pub fn profile_concentrated_amm_ticks(
         let read_used_pct = ((reads as f64 / limits.max_read_entries as f64) * 100.0) as u32;
         let write_used_pct = ((writes as f64 / limits.max_write_entries as f64) * 100.0) as u32;
 
-        let cpu_headroom_pct = 100saturating_sub(cpu_used_pct);
-        let read_headroom_pct = 100saturating_sub(read_used_pct);
-        let write_headroom_pct = 100saturating_sub(write_used_pct);
+        let cpu_headroom_pct = 100u32.saturating_sub(cpu_used_pct);
+        let read_headroom_pct = 100u32.saturating_sub(read_used_pct);
+        let write_headroom_pct = 100u32.saturating_sub(write_used_pct);
 
         let mut limiting_dim = None;
         if read_used_pct >= 90 {
@@ -538,15 +670,18 @@ pub struct UpgradeProfile {
 
 /// Match the local fee formula used by simulation results.
 pub fn estimate_resource_fee_stroops(resources: &SorobanResources) -> u64 {
-    let cpu_cost = resources.cpu_instructions / 10_000;
-    let ram_cost = resources.ram_bytes / 1_024;
-    let ledger_bytes = resources
-        .ledger_read_bytes
-        .saturating_add(resources.ledger_write_bytes);
-    let ledger_cost = ledger_bytes / 1_024;
-    cpu_cost
-        .saturating_add(ram_cost)
-        .saturating_add(ledger_cost)
+    let config = crate::fee_quote::SorobanFeeConfig::checked_in();
+    let footprint = crate::fee_quote::FeeQuoteInput {
+        transaction_size_bytes: 0,
+        ..crate::fee_quote::FeeQuoteInput::from_soroban_resources(resources, None)
+    };
+    crate::fee_quote::price_local_resource_fee(
+        resources,
+        &footprint,
+        crate::fee_quote::DurabilitySplit::unknown(),
+        config,
+    )
+    .resource_fee
 }
 
 /// Result of a batched simulation snapshot ledger hydration operation.
@@ -1320,8 +1455,191 @@ pub struct OptimizationReport {
     pub recommended: SorobanResources,
 }
 
+// ── Cost breakdown ─────────────────────────────────────────────────────────────
+
+/// The CPU and memory budget consumed by a single Soroban host cost type.
+///
+/// `cpu_units` is the raw instruction count charged for this type; `mem_bytes`
+/// is the memory charged.  The host meters different operations on different
+/// scales, so the two numbers are not directly comparable, but their relative
+/// magnitudes within a single field tell you which type dominates that
+/// dimension.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CostEntry {
+    pub cpu_units: u64,
+    pub mem_bytes: u64,
+}
+
+/// Per-cost-type breakdown of the host budget for one invocation.
+///
+/// `entries` maps a Soroban cost-type name (e.g. `"WasmInsnExec"`,
+/// `"InvokeVmFunction"`, `"VisitObject"`) to the CPU and memory that type
+/// consumed.  `remainder_cpu` / `remainder_mem` capture the portion of the
+/// total budget that was not attributed to any named cost type — either because
+/// the node did not emit a budget diagnostic for it, or because it belongs to a
+/// type not yet recognised by this parser.
+///
+/// Invariant: `entries.values().map(|e| e.cpu_units).sum() + remainder_cpu`
+/// equals `total_cpu`, and the same holds for `mem_bytes`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CostBreakdown {
+    /// Named cost-type entries, keyed by the Soroban cost-type symbol.
+    pub entries: std::collections::HashMap<String, CostEntry>,
+    /// CPU units not attributed to any named cost type.
+    pub remainder_cpu: u64,
+    /// Memory bytes not attributed to any named cost type.
+    pub remainder_mem: u64,
+    /// Total CPU across all entries plus the remainder.
+    pub total_cpu: u64,
+    /// Total memory across all entries plus the remainder.
+    pub total_mem: u64,
+}
+
+impl CostBreakdown {
+    /// Return the entry whose `cpu_units` is highest, along with its name.
+    /// Returns `None` when there are no named entries.
+    pub fn dominant_cpu_type(&self) -> Option<(&str, &CostEntry)> {
+        self.entries
+            .iter()
+            .max_by_key(|(_, e)| e.cpu_units)
+            .map(|(name, entry)| (name.as_str(), entry))
+    }
+
+    /// Fraction (0.0–1.0) of total CPU attributed to the named cost type.
+    /// Returns `0.0` when the type is absent or `total_cpu` is zero.
+    pub fn cpu_fraction(&self, cost_type: &str) -> f64 {
+        if self.total_cpu == 0 {
+            return 0.0;
+        }
+        let units = self
+            .entries
+            .get(cost_type)
+            .map(|e| e.cpu_units)
+            .unwrap_or(0);
+        units as f64 / self.total_cpu as f64
+    }
+
+    /// Verify that attributed CPU + remainder equals `total_cpu`, and the
+    /// same for memory.  Returns `false` only when the breakdown is internally
+    /// inconsistent (possible if the node sent malformed diagnostics).
+    pub fn is_consistent(&self) -> bool {
+        let attributed_cpu: u64 = self
+            .entries
+            .values()
+            .fold(0u64, |acc, e| acc.saturating_add(e.cpu_units));
+        let attributed_mem: u64 = self
+            .entries
+            .values()
+            .fold(0u64, |acc, e| acc.saturating_add(e.mem_bytes));
+        attributed_cpu.saturating_add(self.remainder_cpu) == self.total_cpu
+            && attributed_mem.saturating_add(self.remainder_mem) == self.total_mem
+    }
+}
+
+/// Parse a cost breakdown from a slice of base64-encoded XDR
+/// [`DiagnosticEvent`] strings.
+///
+/// The Soroban host (protocol ≥ 20) emits one diagnostic event per cost type
+/// under the topic key `"budget"` (or `"budget_use"` on older protocol
+/// revisions).  Each such event has:
+///
+/// - `topics[0]`: `Symbol("budget")` or `Symbol("budget_use")`
+/// - `topics[1]`: `Symbol(<cost_type_name>)` — e.g. `"WasmInsnExec"`
+/// - `data`:      `Vec[U64(cpu_units), U64(mem_bytes)]`
+///
+/// Any event that does not match this layout is silently skipped; this
+/// function never fails.  When no matching events are found it returns `None`.
+///
+/// The `total_cpu` / `total_mem` totals are taken from `reported_cpu` /
+/// `reported_mem` (the `cpuInsns` / `memBytes` from the RPC `cost` object).
+/// The remainder is the difference between those totals and the sum of the
+/// named entries, clamped to zero so a rounding discrepancy never goes
+/// negative.
+pub fn parse_cost_breakdown_from_events(
+    events: &[String],
+    reported_cpu: u64,
+    reported_mem: u64,
+) -> Option<CostBreakdown> {
+    use soroban_sdk::xdr::{ScVal, VecM};
+
+    let mut entries: std::collections::HashMap<String, CostEntry> =
+        std::collections::HashMap::new();
+
+    for event_b64 in events {
+        let bytes = match BASE64.decode(event_b64) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let diag_event = match DiagnosticEvent::from_xdr(&bytes, Limits::none()) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let topics: &VecM<ScVal> = match &diag_event.event.body {
+            soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.topics,
+        };
+        let data: &ScVal = match &diag_event.event.body {
+            soroban_sdk::xdr::ContractEventBody::V0(v0) => &v0.data,
+        };
+
+        if topics.len() < 2 {
+            continue;
+        }
+
+        // topic[0] must be the budget sentinel symbol.
+        let topic0 = match &topics[0] {
+            ScVal::Symbol(s) => s.to_string(),
+            _ => continue,
+        };
+        if topic0 != "budget" && topic0 != "budget_use" {
+            continue;
+        }
+
+        // topic[1] is the cost-type name.
+        let cost_type = match &topics[1] {
+            ScVal::Symbol(s) => s.to_string(),
+            _ => continue,
+        };
+
+        // data must be a two-element Vec with [cpu_units, mem_bytes].
+        let (cpu_units, mem_bytes) = match data {
+            ScVal::Vec(Some(v)) if v.len() >= 2 => {
+                let cpu = match &v[0] {
+                    ScVal::U64(n) => *n,
+                    _ => continue,
+                };
+                let mem = match &v[1] {
+                    ScVal::U64(n) => *n,
+                    _ => continue,
+                };
+                (cpu, mem)
+            }
+            _ => continue,
+        };
+
+        let entry = entries.entry(cost_type).or_default();
+        entry.cpu_units = entry.cpu_units.saturating_add(cpu_units);
+        entry.mem_bytes = entry.mem_bytes.saturating_add(mem_bytes);
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    let attributed_cpu: u64 = entries.values().map(|e| e.cpu_units).sum();
+    let attributed_mem: u64 = entries.values().map(|e| e.mem_bytes).sum();
+
+    Some(CostBreakdown {
+        entries,
+        remainder_cpu: reported_cpu.saturating_sub(attributed_cpu),
+        remainder_mem: reported_mem.saturating_sub(attributed_mem),
+        total_cpu: reported_cpu,
+        total_mem: reported_mem,
+    })
+}
+
 /// Complete simulation result including resources and metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SimulationResult {
     pub resources: SorobanResources,
     #[serde(default)]
@@ -1347,8 +1665,25 @@ pub struct SimulationResult {
     /// Snapshot of the ledger state used/touched during simulation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_snapshot: Option<SimulationStateSnapshot>,
+    /// Credential-free summary of the authorization entries that gated this
+    /// invocation. Defaults to the empty tree for callers that do not build one.
+    #[serde(default)]
+    pub auth_tree: AuthTreeReport,
     /// Protocol version used for this simulation
     pub protocol_version: u32,
+    /// Per-cost-type breakdown of the host budget for this invocation.
+    ///
+    /// Present only when the node returned budget diagnostic events.  Absent
+    /// for pre-protocol-20 nodes and for RPC responses that contain no budget
+    /// events.  Never causes a simulation to fail when missing.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost_breakdown: Option<CostBreakdown>,
+    /// Usage-vs-limit headroom for CPU, memory, entry counts and tx size.
+    ///
+    /// Computed offline from measured resources plus footprint-derived entry
+    /// counts. Absent only when the caller supplied no resource measurements.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub limit_headroom: Option<LimitHeadroom>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1371,24 +1706,29 @@ pub struct CallNode {
     pub contract_id: String,
     pub function: String,
     pub children: Vec<CallNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_instructions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_read_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_write_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_cpu_instructions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_ram_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_ledger_read_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_ledger_write_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
     pub root: CallNode,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct NetworkLimits {
-    pub max_transaction_size_bytes: u64,
-}
-
-impl Default for NetworkLimits {
-    fn default() -> Self {
-        Self {
-            max_transaction_size_bytes: 100_000,
-        }
-    }
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1439,7 +1779,6 @@ impl AuthTreeReport {
                 SorobanCredentials::Address(credentials) => match &credentials.address {
                     ScAddress::Account(_) => AuthCredentialKind::Ed25519,
                     ScAddress::Contract(_) => AuthCredentialKind::Contract,
-                    _ => AuthCredentialKind::Other,
                 },
             });
         }
@@ -1475,9 +1814,13 @@ impl CallGraph {
 
     fn append_mermaid_nodes(&self, node: &CallNode, mermaid: &mut String, id_gen: &mut usize) {
         let current_id = *id_gen;
+        let cpu_label = node
+            .exclusive_cpu_instructions
+            .map(|cpu| format!("\\nCPU (exclusive): {cpu}"))
+            .unwrap_or_default();
         mermaid.push_str(&format!(
-            "    n{current_id}[\"{}:{}\"]\n",
-            node.contract_id, node.function
+            "    n{current_id}[\"{}:{}{cpu_label}\"]\n",
+            node.contract_id, node.function,
         ));
 
         for child in &node.children {
@@ -1646,8 +1989,7 @@ pub fn project_entry_growth(
     let bytes_remaining = max_entry_size_bytes - current_size_bytes;
     Some(EntryGrowthProjection {
         bytes_per_call,
-        estimated_calls_remaining: bytes_remaining
-            .saturating_add(bytes_per_call - 1)
+        estimated_calls_remaining: bytes_remaining.saturating_add(bytes_per_call - 1)
             / bytes_per_call,
     })
 }
@@ -1667,7 +2009,11 @@ pub fn extract_written_contract_data_keys(transaction_data: &str) -> Vec<String>
         .iter()
         .filter_map(|key| {
             matches!(key, LedgerKey::ContractData(_))
-                .then(|| key.to_xdr(Limits::none()).ok().map(|bytes| BASE64.encode(bytes)))
+                .then(|| {
+                    key.to_xdr(Limits::none())
+                        .ok()
+                        .map(|bytes| BASE64.encode(bytes))
+                })
                 .flatten()
         })
         .collect()
@@ -1957,6 +2303,8 @@ pub struct SimulationRpcResult {
     transaction_data: String,
     #[serde(default)]
     latest_ledger: u64,
+    #[serde(default)]
+    min_resource_fee: Option<serde_json::Value>,
     #[serde(default)]
     cost: Option<ResourceCost>,
     #[serde(default)]
@@ -2564,10 +2912,7 @@ impl SimulationEngine {
             original_fee_breakdown: decoded.resource_fee_breakdown,
             new_resources: replay.resources,
             new_cost_stroops: replay.cost_stroops,
-            auth_tree: AuthTreeReport::summarize(
-                &decoded.auth_entries,
-                NetworkLimits::default(),
-            )?,
+            auth_tree: AuthTreeReport::summarize(&decoded.auth_entries, NetworkLimits::default())?,
             original_meta_version: decoded.original_meta_version,
             skipped_operation_count: decoded.skipped_operation_count,
             original_protocol_version: None,
@@ -2847,6 +3192,7 @@ impl SimulationEngine {
             ledger_read_bytes: (min_ledger_read as f64 * (1.0 + safety_margin)) as u64,
             ledger_write_bytes: (min_ledger_write as f64 * (1.0 + safety_margin)) as u64,
             transaction_size_bytes: estimate.transaction_size_bytes,
+            ..Default::default()
         };
 
         Ok(OptimizationReport {
@@ -3530,69 +3876,11 @@ impl SimulationEngine {
     }
 
     fn extract_call_graph(&self, events: &[String]) -> Option<CallGraph> {
-        let mut stack: Vec<CallNode> = Vec::new();
-        let mut root: Option<CallNode> = None;
-
-        for event_b64 in events {
-            let bytes = match BASE64.decode(event_b64) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            let diag_event = match DiagnosticEvent::from_xdr(&bytes, Limits::none()) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            if !diag_event.in_successful_contract_call {
-                continue;
-            }
-
-            let contract_id = match &diag_event.event.contract_id {
-                Some(Hash(h)) => Strkey::Contract(StrkeyContract(*h)).to_string(),
-                None => "Host".to_string(),
-            };
-
-            let (topics, _data) = match &diag_event.event.body {
-                soroban_sdk::xdr::ContractEventBody::V0(v0) => (&v0.topics, &v0.data),
-            };
-
-            if topics.is_empty() {
-                continue;
-            }
-
-            let topic0 = match &topics[0] {
-                ScVal::Symbol(s) => s.to_string(),
-                _ => continue,
-            };
-
-            if topic0 == "fn_call" && topics.len() >= 3 {
-                // Topic 1: Contract Address (ignored since we use event.contract_id)
-                // Topic 2: Function Name
-                let function = match &topics[2] {
-                    ScVal::Symbol(s) => s.to_string(),
-                    _ => "unknown".to_string(),
-                };
-
-                let node = CallNode {
-                    contract_id: contract_id.clone(),
-                    function,
-                    children: Vec::new(),
-                };
-
-                stack.push(node);
-            } else if topic0 == "fn_return" {
-                if let Some(finished_node) = stack.pop() {
-                    if let Some(parent) = stack.last_mut() {
-                        parent.children.push(finished_node);
-                    } else {
-                        root = Some(finished_node);
-                    }
-                }
-            }
-        }
-
-        root.map(|r| CallGraph { root: r })
+        let parsed = crate::call_trace_parser::parse_call_trace_with_cap(events, 0)?;
+        Some(CallGraph {
+            root: convert_call_node(parsed.root),
+            incomplete: parsed.incomplete,
+        })
     }
 
     pub(crate) fn extract_touched_ledger_keys(&self, transaction_data: &str) -> Vec<String> {
@@ -3753,9 +4041,7 @@ impl SimulationEngine {
                     .insert(entry.key.clone(), entry_xdr.clone());
             }
             if let Some(live_until) = entry.live_until_ledger_seq {
-                snapshot
-                    .ttl_entries
-                    .insert(entry.key.clone(), live_until);
+                snapshot.ttl_entries.insert(entry.key.clone(), live_until);
             }
             if let Some(cache) = &self.contract_cache {
                 if let Ok(bytes) = serde_json::to_vec(&entry) {
@@ -3769,10 +4055,7 @@ impl SimulationEngine {
                     key_kind: classify_ledger_key_b64(&entry.key),
                     live_until_ledger: live_until,
                     remaining_ledgers: live_until as i64 - latest_ledger as i64,
-                    entry_xdr_size_bytes: entry
-                        .xdr
-                        .as_deref()
-                        .and_then(Self::entry_xdr_size_bytes),
+                    entry_xdr_size_bytes: entry.xdr.as_deref().and_then(Self::entry_xdr_size_bytes),
                 });
             }
         }
@@ -3794,7 +4077,10 @@ impl SimulationEngine {
     }
 
     fn entry_xdr_size_bytes(entry_xdr: &str) -> Option<u64> {
-        BASE64.decode(entry_xdr).ok().map(|bytes| bytes.len() as u64)
+        BASE64
+            .decode(entry_xdr)
+            .ok()
+            .map(|bytes| bytes.len() as u64)
     }
 
     pub(crate) fn build_extend_ttl_suggestions(
@@ -3942,19 +4228,92 @@ impl SimulationEngine {
                 self.extract_footprint_bytes_by_durability(&rpc_result.transaction_data);
             let ledger_read_bytes = bytes_by_durability.read.total();
             let ledger_write_bytes = bytes_by_durability.write.total();
-            SorobanResources {
+
+            // Attempt to decode a per-cost-type breakdown from the diagnostic
+            // events.  The call never fails; it returns None when the node did
+            // not emit budget events.
+            let cost_breakdown = parse_cost_breakdown_from_events(
+                &rpc_result.events,
+                cpu_instructions,
+                ram_bytes,
+            );
+            if cost_breakdown.is_some() {
+                tracing::debug!("Decoded per-cost-type budget breakdown from diagnostic events");
+            }
+
+            let resources = SorobanResources {
                 cpu_instructions,
                 ram_bytes,
                 ledger_read_bytes,
                 ledger_write_bytes,
                 transaction_size_bytes: rpc_result.transaction_data.len() as u64,
-            }
+                ..Default::default()
+            };
+
+            let cost_stroops = self.calculate_cost(&resources);
+            return Ok(SimulationResult {
+                resources,
+                bytes_by_durability,
+                transaction_hash: None,
+                latest_ledger: rpc_result.latest_ledger,
+                cost_stroops,
+                rent_bytes,
+                state_dependency: None,
+                ttl_analysis: None,
+                transaction_data: rpc_result.transaction_data,
+                call_graph: None,
+                state_snapshot: None,
+                protocol_version: 0,
+                cost_breakdown,
+                ..Default::default()
+            });
         } else {
             tracing::warn!("No cost data in simulation result, using defaults");
             SorobanResources::default()
         };
 
-        let cost_stroops = self.calculate_cost(&resources);
+        let fee_config = crate::fee_quote::SorobanFeeConfig::checked_in();
+        let mut footprint = crate::fee_quote::FeeQuoteInput::from_soroban_resources(
+            &resources,
+            rent_bytes,
+        );
+        footprint.read_entries = bytes_by_durability.read.entries;
+        footprint.write_entries = bytes_by_durability.write.entries;
+        let durability_split = if bytes_by_durability.write.other == 0
+            && bytes_by_durability.write.code == 0
+            && bytes_by_durability.write.instance == 0
+        {
+            crate::fee_quote::DurabilitySplit::mixed(
+                bytes_by_durability.write.temporary,
+                bytes_by_durability.write.persistent,
+            )
+        } else {
+            crate::fee_quote::DurabilitySplit::unknown()
+        };
+        let priced_fee = crate::fee_quote::price_local_resource_fee(
+            &resources,
+            &footprint,
+            durability_split,
+            fee_config,
+        );
+        let cost_stroops = priced_fee.resource_fee;
+        let rpc_min_resource_fee = rpc_result
+            .min_resource_fee
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .or_else(|| value.as_u64())
+            });
+        let fee_calibration = crate::fee_quote::FeeCalibration::compare_rpc(
+            cost_stroops,
+            rpc_min_resource_fee,
+            fee_config,
+        );
+        if let Some(error) = &fee_calibration.calibration_error {
+            tracing::error!(%error, "Local resource fee failed RPC calibration");
+        }
         Ok(SimulationResult {
             resources,
             bytes_by_durability,
@@ -3968,6 +4327,7 @@ impl SimulationEngine {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0, // RPC version unknown here, will be updated if possible
+            fee_calibration,
         })
     }
 
@@ -4559,6 +4919,7 @@ pub fn profile_contract(
         ledger_read_bytes: 0,
         ledger_write_bytes: 0,
         transaction_size_bytes: wasm_bytes.len() as u64,
+        ..Default::default()
     })
 }
 
@@ -4600,6 +4961,7 @@ pub fn profile_contract_deploy(wasm_bytes: Vec<u8>) -> Result<DeployProfile, Sim
         ledger_read_bytes: 0,
         ledger_write_bytes: code_entry_write_bytes.saturating_add(instance_entry_write_bytes),
         transaction_size_bytes: wasm_size_bytes,
+        ..Default::default()
     };
 
     Ok(DeployProfile {
@@ -4928,6 +5290,7 @@ pub fn profile_contract_with_flamegraph(
         ledger_read_bytes: 0,
         ledger_write_bytes: 0,
         transaction_size_bytes: wasm_size as u64,
+        ..Default::default()
     };
 
     // ── Collect per-function counts ───────────────────────────────────────────
@@ -5043,13 +5406,19 @@ mod tests {
 
     #[test]
     fn execution_failed_display_names_the_kind_and_resolved_error() {
-        let failure = ExecutionFailure::from_diagnostic("HostError: Error(Contract, #3)")
-            .at(Some("CBQHNAX3CFZWBUF2J4C6QEBGB2FEHZPXN2O3KILYZQ2X5XNBEHXHDW5TK".into()), Some("transfer".into()));
+        let failure = ExecutionFailure::from_diagnostic("HostError: Error(Contract, #3)").at(
+            Some("CBQHNAX3CFZWBUF2J4C6QEBGB2FEHZPXN2O3KILYZQ2X5XNBEHXHDW5TK".into()),
+            Some("transfer".into()),
+        );
         let err = SimulationError::ExecutionFailed(failure);
 
         let rendered = err.to_string();
         assert!(rendered.contains("contract_trap"), "got {}", rendered);
-        assert!(rendered.contains("contracterror #3 (Unauthorized)"), "got {}", rendered);
+        assert!(
+            rendered.contains("contracterror #3 (Unauthorized)"),
+            "got {}",
+            rendered
+        );
         assert!(rendered.contains("transfer"), "got {}", rendered);
     }
 
@@ -5221,6 +5590,7 @@ mod tests {
             ledger_read_bytes: 512,
             ledger_write_bytes: 256,
             transaction_size_bytes: 1024,
+            ..Default::default()
         };
         let json = serde_json::to_string(&resources).unwrap();
         assert!(json.contains("\"cpu_instructions\":1000000"));
@@ -5239,6 +5609,7 @@ mod tests {
             ledger_read_bytes: 512,
             ledger_write_bytes: 256,
             transaction_size_bytes: 128,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -5264,6 +5635,7 @@ mod tests {
             ledger_read_bytes: 300,
             ledger_write_bytes: 400,
             transaction_size_bytes: 128,
+            ..Default::default()
         };
 
         ResourceSearchKind::Cpu.apply_candidate(&mut resources, 10);
@@ -5337,6 +5709,7 @@ mod tests {
                 ledger_read_bytes: 10,
                 ledger_write_bytes: 20,
                 transaction_size_bytes: 30,
+                ..Default::default()
             },
             auth_tree: AuthTreeReport::default(),
             transaction_hash: None,
@@ -5349,6 +5722,7 @@ mod tests {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
+            fee_calibration: Default::default(),
         };
         let second = SimulationResult {
             latest_ledger: 2000,
@@ -5372,6 +5746,7 @@ mod tests {
                 ledger_read_bytes: 10,
                 ledger_write_bytes: 20,
                 transaction_size_bytes: 30,
+                ..Default::default()
             },
             auth_tree: AuthTreeReport::default(),
             transaction_hash: None,
@@ -5384,6 +5759,7 @@ mod tests {
             call_graph: None,
             state_snapshot: None,
             protocol_version: 0,
+            fee_calibration: Default::default(),
         };
         let mut second = first.clone();
         second.resources.cpu_instructions = 101;
@@ -5409,6 +5785,7 @@ mod tests {
                 ledger_read_bytes,
                 ledger_write_bytes,
                 transaction_size_bytes,
+                ..Default::default()
             },
             touched_ledger_keys,
         }
@@ -5528,6 +5905,7 @@ mod tests {
             ledger_read_bytes: 512,
             ledger_write_bytes: 512,
             transaction_size_bytes: 1024,
+            ..Default::default()
         };
         assert!(engine.calculate_cost(&resources) > 0);
     }
@@ -5701,10 +6079,7 @@ mod tests {
 
     #[test]
     fn test_extract_soroban_budget_limits_missing_values_returns_none() {
-        assert_eq!(
-            extract_soroban_budget_limits("budget: cpu: 123"),
-            None
-        );
+        assert_eq!(extract_soroban_budget_limits("budget: cpu: 123"), None);
     }
 
     #[test]
@@ -5820,6 +6195,7 @@ mod tests {
                     ledger_read_bytes: 512,
                     ledger_write_bytes: 256,
                     transaction_size_bytes: 128,
+                    ..Default::default()
                 },
                 auth_tree: AuthTreeReport::default(),
                 transaction_hash: None,
@@ -5832,6 +6208,7 @@ mod tests {
                 call_graph: None,
                 state_snapshot: None,
                 protocol_version: 0,
+                fee_calibration: Default::default(),
             }
         }
 
@@ -6094,7 +6471,10 @@ mod tests {
         let restore_suggestions = SimulationEngine::build_restore_ttl_suggestions(&entries, 500);
         assert_eq!(restore_suggestions.len(), 1);
         assert_eq!(restore_suggestions[0].key, "key-c");
-        assert_eq!(restore_suggestions[0].suggested_operation, "RestoreFootprint");
+        assert_eq!(
+            restore_suggestions[0].suggested_operation,
+            "RestoreFootprint"
+        );
         assert!(restore_suggestions[0].estimated_rent_stroops.unwrap() > 0);
         assert!(restore_suggestions[0].estimated_write_stroops.unwrap() > 0);
     }
@@ -6124,6 +6504,7 @@ mod tests {
         let suggestion = ttl_batch_test_suggestion("key-a", 10, 10, 44);
         let limits = NetworkLimits {
             max_cpu_instructions: 10,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 0,
             max_write_entries: 1,
             max_transaction_size_bytes: TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES + 44,
@@ -6153,6 +6534,7 @@ mod tests {
         ];
         let limits = NetworkLimits {
             max_cpu_instructions: 10,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 0,
             max_write_entries: 1,
             max_transaction_size_bytes: 1_000,
@@ -6185,6 +6567,7 @@ mod tests {
         let suggestion = ttl_batch_test_suggestion("key-a", 10, 11, 45);
         let base_limits = NetworkLimits {
             max_cpu_instructions: 10,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 0,
             max_write_entries: 1,
             max_transaction_size_bytes: TTL_BATCH_BASE_TRANSACTION_SIZE_BYTES + 45,
@@ -6262,24 +6645,22 @@ mod tests {
     #[test]
     fn test_entry_size_analysis_reports_instance_and_temporary_entries() {
         use soroban_sdk::xdr::{
-            ContractDataEntry, ContractDataDurability, ContractExecutable, ExtensionPoint,
+            ContractDataDurability, ContractDataEntry, ContractExecutable, ExtensionPoint,
             LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData,
             ScAddress, ScContractInstance, ScVal, WriteXdr,
         };
 
         let contract = ScAddress::Contract(Hash([0u8; 32]));
-        let make_entry = |key: ScVal, durability, val| {
-            LedgerEntry {
-                last_modified_ledger_seq: 1,
-                data: LedgerEntryData::ContractData(ContractDataEntry {
-                    ext: ExtensionPoint::V0,
-                    contract: contract.clone(),
-                    key,
-                    durability,
-                    val,
-                }),
-                ext: LedgerEntryExt::V0,
-            }
+        let make_entry = |key: ScVal, durability, val| LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: contract.clone(),
+                key,
+                durability,
+                val,
+            }),
+            ext: LedgerEntryExt::V0,
         };
         let cases = [
             (
@@ -6798,15 +7179,13 @@ mod tests {
             },
         ];
 
-        let step2 = vec![
-            ScenarioKeyAccess {
-                step_index: 2,
-                key: "ADMIN_CONFIG".to_string(),
-                key_type: "persistent".to_string(),
-                access_type: "read".to_string(),
-                key_bytes: 64,
-            },
-        ];
+        let step2 = vec![ScenarioKeyAccess {
+            step_index: 2,
+            key: "ADMIN_CONFIG".to_string(),
+            key_type: "persistent".to_string(),
+            access_type: "read".to_string(),
+            key_bytes: 64,
+        }];
 
         let report = analyze_instance_storage_candidates(&[step0, step1, step2], 1);
         assert_eq!(report.status, "available");
@@ -6860,15 +7239,19 @@ mod tests {
     fn test_extract_soroban_budget_from_logs_v21_and_legacy() {
         // v21+ format
         let v21_logs = "INFO soroban_cli::run: Budget: cpu: 1234567, mem: 987654";
-        let parsed_v21 = extract_soroban_budget_from_logs(v21_logs);
-        assert_eq!(parsed_v21.cpu_instructions, 1234567);
-        assert_eq!(parsed_v21.memory_bytes, 987654);
+        assert_eq!(
+            extract_soroban_budget_limits(v21_logs),
+            Some((1_234_567, 987_654))
+        );
 
         // Legacy format
         let legacy_logs = "Budget report:\nCpuCost: 500000\nMemCost: 250000";
-        let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
-        assert_eq!(parsed_legacy.cpu_instructions, 500000);
-        assert_eq!(parsed_legacy.memory_bytes, 250000);
+        assert_eq!(
+            extract_soroban_budget_limits(legacy_logs),
+            Some((500_000, 250_000))
+        );
+    }
+
     #[test]
     fn test_profile_concentrated_amm_ticks_monotonic_and_warning() {
         // Swaps crossing 1, 2, 4, 8 ticks with increasing CPU and reads
@@ -6881,6 +7264,7 @@ mod tests {
 
         let limits = NetworkLimits {
             max_cpu_instructions: 100_000_000,
+            max_memory_bytes: default_max_memory_bytes(),
             max_read_entries: 40,
             max_write_entries: 20,
             max_transaction_size_bytes: 100_000,
@@ -6913,7 +7297,142 @@ mod tests {
 
         let result = profile_concentrated_amm_ticks(&non_monotonic, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Non-monotonic read entries detected"));
+        assert!(result
+            .unwrap_err()
+            .contains("Non-monotonic read entries detected"));
+    }
+
+    // ── #991: network limits & limit headroom ──────────────────────────────
+
+    #[test]
+    fn default_network_limits_include_memory_and_builtin_source() {
+        let limits = NetworkLimits::default();
+        assert_eq!(limits.max_cpu_instructions, 100_000_000);
+        assert_eq!(limits.max_memory_bytes, 40 * 1024 * 1024);
+        assert_eq!(limits.max_read_entries, 40);
+        assert_eq!(limits.max_write_entries, 20);
+        assert_eq!(limits.max_transaction_size_bytes, 100_000);
+        assert_eq!(limits.max_entry_size_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn footprint_entry_counts_come_from_xdr_not_bytes() {
+        // xdr::SorobanResources (footprint/instructions/...) is distinct from
+        // the local SorobanResources; alias it to avoid the name clash.
+        use soroban_sdk::xdr::SorobanResources as XdrSorobanResources;
+
+        // Synthetic SorobanTransactionData with 2 readOnly + 3 readWrite keys.
+        let data = SorobanTransactionData {
+            ext: ExtensionPoint::V0,
+            resources: XdrSorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::try_from(vec![
+                        LedgerKey::ContractData(LedgerKeyContractData {
+                            contract: ScAddress::Contract(Hash([1; 32])),
+                            key: ScVal::Symbol(ScSymbol::try_from("A").unwrap()),
+                            durability: ContractDataDurability::Persistent,
+                        });
+                        2
+                    ])
+                    .unwrap(),
+                    read_write: VecM::try_from(vec![
+                        LedgerKey::ContractData(LedgerKeyContractData {
+                            contract: ScAddress::Contract(Hash([2; 32])),
+                            key: ScVal::Symbol(ScSymbol::try_from("B").unwrap()),
+                            durability: ContractDataDurability::Persistent,
+                        });
+                        3
+                    ])
+                    .unwrap(),
+                },
+                instructions: 0,
+                read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+        let xdr = data.to_xdr(Limits::none()).unwrap();
+        let b64 = BASE64.encode(xdr);
+
+        let (read_entries, write_entries) = extract_footprint_entry_counts(&b64);
+        assert_eq!(read_entries, 5); // 2 readOnly + 3 readWrite
+        assert_eq!(write_entries, 3); // only readWrite
+
+        // Undecodable payload degrades to (0, 0), never panics.
+        assert_eq!(extract_footprint_entry_counts("not-base64"), (0, 0));
+    }
+
+    #[test]
+    fn limit_headroom_write_entries_just_under_and_over_the_limit() {
+        let limits = NetworkLimits {
+            max_cpu_instructions: 1_000_000,
+            max_memory_bytes: 1_000_000,
+            max_read_entries: 40,
+            max_write_entries: 20,
+            max_transaction_size_bytes: 100_000,
+            max_entry_size_bytes: 64 * 1024,
+        };
+        let resources = SorobanResources {
+            cpu_instructions: 100_000,
+            ram_bytes: 100_000,
+            transaction_size_bytes: 1_000,
+            ..Default::default()
+        };
+
+        // Just under: 18/20 = 90% → Critical on write_entries.
+        let under = compute_limit_headroom(
+            &resources,
+            Some((30, 18)),
+            &limits,
+            LimitsSource::Builtin,
+        );
+        assert_eq!(under.write_entries.used, 18);
+        assert_eq!(under.write_entries.limit, 20);
+        assert_eq!(under.write_entries.percent_used, 90);
+        assert_eq!(under.limits_source, LimitsSource::Builtin);
+        assert_eq!(
+            first_dimension_at_or_above(&under, 90),
+            Some("write_entries")
+        );
+
+        // Over the limit: 21/20 clamps to 100%.
+        let over = compute_limit_headroom(
+            &resources,
+            Some((30, 21)),
+            &limits,
+            LimitsSource::Builtin,
+        );
+        assert_eq!(over.write_entries.used, 21);
+        assert_eq!(over.write_entries.percent_used, 100);
+        assert_eq!(over.write_entries.percent_remaining, 0);
+        assert_eq!(
+            first_dimension_at_or_above(&over, 90),
+            Some("write_entries")
+        );
+    }
+
+    #[test]
+    fn limit_headroom_names_first_failing_dimension_in_issue_order() {
+        let limits = NetworkLimits::default();
+        let resources = SorobanResources {
+            // 95% of 100M
+            cpu_instructions: 95_000_000,
+            // 80% of 40MiB — also elevated, but CPU comes first
+            ram_bytes: 32 * 1024 * 1024,
+            transaction_size_bytes: 1_000,
+            ..Default::default()
+        };
+        let headroom = compute_limit_headroom(
+            &resources,
+            Some((40, 20)),
+            &limits,
+            LimitsSource::Rpc,
+        );
+        assert_eq!(
+            first_dimension_at_or_above(&headroom, 90),
+            Some("cpu_instructions")
+        );
+        assert_eq!(headroom.limits_source, LimitsSource::Rpc);
     }
 
     #[tokio::test]
@@ -7017,6 +7536,245 @@ mod tests {
         assert_eq!(report.fetched_entries.len(), 10);
         assert_eq!(report.missing_keys.len(), 5);
     }
+
+    // ── CostBreakdown / parse_cost_breakdown_from_events (issue #989) ─────────
+
+    /// Build a well-formed budget diagnostic event with the format:
+    ///   topics = [Symbol("budget"), Symbol(<cost_type>)]
+    ///   data   = Vec[U64(cpu_units), U64(mem_bytes)]
+    fn make_budget_event(cost_type: &str, cpu_units: u64, mem_bytes: u64) -> String {
+        use soroban_sdk::xdr::{
+            ContractEvent, ContractEventBody, ContractEventType, ContractEventV0,
+            DiagnosticEvent, ScSymbol, ScVal, ScVec, StringM, VecM, WriteXdr,
+        };
+
+        let sym = |s: &str| -> ScVal {
+            let string_m: StringM<32> = s.as_bytes().to_vec().try_into().unwrap();
+            ScVal::Symbol(ScSymbol(string_m))
+        };
+
+        let topics: VecM<ScVal> = vec![sym("budget"), sym(cost_type)].try_into().unwrap();
+        let data_vec: VecM<ScVal> = vec![ScVal::U64(cpu_units), ScVal::U64(mem_bytes)]
+            .try_into()
+            .unwrap();
+        let data = ScVal::Vec(Some(ScVec(data_vec)));
+
+        let event = DiagnosticEvent {
+            in_successful_contract_call: true,
+            event: ContractEvent {
+                ext: soroban_sdk::xdr::ExtensionPoint::V0,
+                contract_id: None,
+                type_: ContractEventType::Diagnostic,
+                body: ContractEventBody::V0(ContractEventV0 { topics, data }),
+            },
+        };
+        BASE64.encode(event.to_xdr(Limits::none()).unwrap())
+    }
+
+    // ── Fixture: cpu_heavy — dominated by WasmInsnExec ────────────────────────
+
+    /// Simulates a `cpu_heavy` trace: 80% of CPU is WASM arithmetic (WasmInsnExec),
+    /// 15% is VisitObject, 5% is remainder (unattributed).
+    #[test]
+    fn cpu_heavy_trace_dominant_type_is_wasm_insn_exec() {
+        let total_cpu: u64 = 50_000_000;
+        let total_mem: u64 = 2_000_000;
+
+        let wasm_cpu = (total_cpu as f64 * 0.80) as u64; // 40_000_000
+        let visit_cpu = (total_cpu as f64 * 0.15) as u64; // 7_500_000
+
+        let events = vec![
+            make_budget_event("WasmInsnExec", wasm_cpu, 1_500_000),
+            make_budget_event("VisitObject", visit_cpu, 500_000),
+        ];
+
+        let breakdown =
+            parse_cost_breakdown_from_events(&events, total_cpu, total_mem)
+                .expect("cpu_heavy trace should produce a breakdown");
+
+        // WasmInsnExec must be the dominant type
+        let (dominant_name, dominant_entry) = breakdown
+            .dominant_cpu_type()
+            .expect("should have a dominant type");
+        assert_eq!(dominant_name, "WasmInsnExec");
+        assert_eq!(dominant_entry.cpu_units, wasm_cpu);
+
+        // WasmInsnExec fraction must be > 40% threshold
+        assert!(
+            breakdown.cpu_fraction("WasmInsnExec") > 0.40,
+            "WasmInsnExec fraction should exceed 40%, got {:.1}%",
+            breakdown.cpu_fraction("WasmInsnExec") * 100.0
+        );
+
+        // Percentages sum to 100%
+        assert!(
+            breakdown.is_consistent(),
+            "cpu_heavy breakdown must be internally consistent"
+        );
+        let attributed_frac: f64 = breakdown
+            .entries
+            .values()
+            .map(|e| e.cpu_units as f64 / total_cpu as f64)
+            .sum::<f64>();
+        let remainder_frac = breakdown.remainder_cpu as f64 / total_cpu as f64;
+        let total_frac = (attributed_frac + remainder_frac) * 100.0;
+        assert!(
+            (total_frac - 100.0).abs() < 0.1,
+            "percentages should sum to 100%, got {:.2}%",
+            total_frac
+        );
+    }
+
+    // ── Fixture: cross_call — dominated by InvokeVmFunction ──────────────────
+
+    /// Simulates a `cross_call` trace: 70% of CPU is cross-contract invocation
+    /// overhead (InvokeVmFunction), 25% is WasmInsnExec, 5% remainder.
+    #[test]
+    fn cross_call_trace_dominant_type_is_invoke_vm_function() {
+        let total_cpu: u64 = 30_000_000;
+        let total_mem: u64 = 1_000_000;
+
+        let invoke_cpu = (total_cpu as f64 * 0.70) as u64; // 21_000_000
+        let wasm_cpu   = (total_cpu as f64 * 0.25) as u64; // 7_500_000
+
+        let events = vec![
+            make_budget_event("InvokeVmFunction", invoke_cpu, 800_000),
+            make_budget_event("WasmInsnExec", wasm_cpu, 200_000),
+        ];
+
+        let breakdown =
+            parse_cost_breakdown_from_events(&events, total_cpu, total_mem)
+                .expect("cross_call trace should produce a breakdown");
+
+        let (dominant_name, _) = breakdown
+            .dominant_cpu_type()
+            .expect("should have a dominant type");
+        assert_eq!(
+            dominant_name, "InvokeVmFunction",
+            "cross_call dominant type should be InvokeVmFunction, not {}",
+            dominant_name
+        );
+
+        // The two contracts produce *different* dominant types
+        // (cpu_heavy → WasmInsnExec, cross_call → InvokeVmFunction).
+        let cpu_heavy_events = vec![
+            make_budget_event("WasmInsnExec", 40_000_000, 0),
+        ];
+        let cpu_heavy_breakdown =
+            parse_cost_breakdown_from_events(&cpu_heavy_events, 50_000_000, 0).unwrap();
+        assert_ne!(
+            breakdown.dominant_cpu_type().map(|(n, _)| n),
+            cpu_heavy_breakdown.dominant_cpu_type().map(|(n, _)| n),
+            "cpu_heavy and cross_call should have different dominant cost types"
+        );
+
+        assert!(breakdown.is_consistent());
+    }
+
+    // ── Fixture: no-diagnostic stream ────────────────────────────────────────
+
+    /// When the node returns no budget events (pre-protocol-20 or stripped
+    /// responses), `parse_cost_breakdown_from_events` returns `None` and the
+    /// simulation must still deserialise successfully.
+    #[test]
+    fn no_budget_events_produces_none_breakdown() {
+        use crate::call_trace_parser::parse_call_trace;
+
+        // Re-use the fn_call/fn_return events from the call trace parser — they
+        // are valid DiagnosticEvent XDR but carry no budget topics.
+        let fn_call_event = {
+            use soroban_sdk::xdr::{
+                ContractEvent, ContractEventBody, ContractEventType, ContractEventV0,
+                DiagnosticEvent, ScSymbol, ScVal, StringM, VecM, WriteXdr,
+            };
+            let sym = |s: &str| -> ScVal {
+                let string_m: StringM<32> = s.as_bytes().to_vec().try_into().unwrap();
+                ScVal::Symbol(ScSymbol(string_m))
+            };
+            let topics: VecM<ScVal> = vec![
+                sym("fn_call"),
+                sym("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"),
+                sym("fibonacci_iterative"),
+            ]
+            .try_into()
+            .unwrap();
+            let event = DiagnosticEvent {
+                in_successful_contract_call: true,
+                event: ContractEvent {
+                    ext: soroban_sdk::xdr::ExtensionPoint::V0,
+                    contract_id: None,
+                    type_: ContractEventType::Diagnostic,
+                    body: ContractEventBody::V0(ContractEventV0 {
+                        topics,
+                        data: ScVal::Void,
+                    }),
+                },
+            };
+            BASE64.encode(event.to_xdr(Limits::none()).unwrap())
+        };
+
+        let events_no_budget = vec![fn_call_event];
+        let result = parse_cost_breakdown_from_events(&events_no_budget, 1_000_000, 50_000);
+        assert!(
+            result.is_none(),
+            "non-budget events must not produce a breakdown"
+        );
+
+        // An empty stream also yields None.
+        assert_eq!(parse_cost_breakdown_from_events(&[], 0, 0), None);
+
+        // A SimulationResult whose cost_breakdown is None must still
+        // round-trip through serde without error.
+        let sim = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 1_000_000,
+                ram_bytes: 50_000,
+                ..Default::default()
+            },
+            transaction_data: "AAA=".to_string(),
+            latest_ledger: 100,
+            cost_stroops: 42,
+            cost_breakdown: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sim).expect("serialisation must not fail");
+        assert!(
+            !json.contains("cost_breakdown"),
+            "absent cost_breakdown must be omitted from JSON"
+        );
+        let roundtrip: SimulationResult =
+            serde_json::from_str(&json).expect("deserialisation must not fail");
+        assert!(roundtrip.cost_breakdown.is_none());
+    }
+
+    // ── parse_cost_breakdown_from_events edge cases ───────────────────────────
+
+    #[test]
+    fn cost_breakdown_accumulates_duplicate_cost_types() {
+        // Two events for the same type must be summed, not overwritten.
+        let events = vec![
+            make_budget_event("WasmInsnExec", 1_000, 100),
+            make_budget_event("WasmInsnExec", 2_000, 200),
+        ];
+        let breakdown =
+            parse_cost_breakdown_from_events(&events, 3_000, 300).unwrap();
+        let entry = &breakdown.entries["WasmInsnExec"];
+        assert_eq!(entry.cpu_units, 3_000);
+        assert_eq!(entry.mem_bytes, 300);
+        assert!(breakdown.is_consistent());
+    }
+
+    #[test]
+    fn cost_breakdown_skips_invalid_events_and_still_returns_result() {
+        let events = vec![
+            "not-base64!".to_string(),
+            make_budget_event("WasmInsnExec", 5_000, 500),
+        ];
+        let breakdown =
+            parse_cost_breakdown_from_events(&events, 5_000, 500).unwrap();
+        assert_eq!(breakdown.entries.len(), 1);
+        assert!(breakdown.is_consistent());
+    }
 }
 
 /// Parsed host budget consumption (CPU instructions, memory bytes) extracted from Soroban CLI log output.
@@ -7034,7 +7792,8 @@ pub fn extract_soroban_budget_from_logs(logs: &str) -> ExtractedSorobanBudget {
     for line in logs.lines() {
         let line_lower = line.to_lowercase();
 
-        if line_lower.contains("cpu") || line_lower.contains("mem") || line_lower.contains("budget") {
+        if line_lower.contains("cpu") || line_lower.contains("mem") || line_lower.contains("budget")
+        {
             if let Some(idx) = line_lower.find("cpu:") {
                 if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
                     result.cpu_instructions = val;
@@ -7088,4 +7847,3 @@ fn parse_trailing_number(s: &str) -> Option<u64> {
         .collect();
     digits.parse().ok()
 }
-

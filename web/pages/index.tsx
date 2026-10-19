@@ -19,7 +19,8 @@ import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
 import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
 import { ErrorBoundary } from '../components/ErrorBoundary';
-import { Toast } from '../components/Toast';
+import { ToastStack, type ToastItem } from '../components/Toast';
+import { dismissToast, enqueueToast } from '../lib/toastQueue.cjs';
 import { ContractInteraction } from "../components/ContractInteraction";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { FunctionSidebar } from "../components/FunctionSidebar";
@@ -33,8 +34,10 @@ import { ResultViewer } from "../components/Resultviewer";
 import { ResultViewerSkeleton } from "../components/ResultViewerSkeleton";
 import { FeeEstimationPreview } from "../components/FeeEstimationPreview";
 import { SyntaxHighlighter } from "../components/SyntaxHighlighter";
+import { WasmDisassemblyViewer } from "../components/WasmDisassemblyViewer";
 import { UploadZone } from "../components/upload-zone";
 import { CopyButton } from "../components/CopyButton";
+import { ContractAddressLink } from "../components/ContractAddressLink";
 import { WalletBalanceCard } from "../components/WalletBalanceCard";
 import { LiquidityPoolAnalytics } from "../components/LiquidityPoolAnalytics";
 import { TransactionConfetti } from "../components/TransactionConfetti";
@@ -90,7 +93,7 @@ const SchemaVisualizer = dynamic(
   },
 );
 
-const VALID_TABS: NavTab[] = ["explorer", "schema", "history", "transactions"];
+const VALID_TABS: NavTab[] = ["explorer", "schema", "disassembly", "history", "transactions"];
   type TransactionStatus,
 } from "../lib/sorobantypes";
 import { DEFAULT_TRANSACTION_FILTER, type TransactionFilter } from "../lib/transactionFilters";
@@ -110,7 +113,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [wasmFile, setWasmFile] = useState<File | null>(null);
   const [wasmData, setWasmData] = useState<string | null>(null);
-  const [toastNotification, setToastNotification] = useState<{ message: string; type: 'error' | 'success' } | null>(null);
+  const [toastNotifications, setToastNotifications] = useState<ToastItem[]>([]);
 
   const [uploadResetKey, setUploadResetKey] = useState(0);
   const mockTransactions = useMemo(() => generateMockTransactions(47), []);
@@ -240,7 +243,11 @@ export default function Home() {
       };
       setCurrentResult(errorResult);
       addToHistory(errorResult);
-      setToastNotification({ message: errorMessage, type: 'error' });
+      setToastNotifications((current) => enqueueToast(current, {
+        id: `${Date.now()}-${Math.random()}`,
+        message: errorMessage,
+        type: 'error',
+      }));
       });
     } finally {
       setLoading(false);
@@ -301,6 +308,11 @@ export default function Home() {
         return {
           pageTitle: 'SoroScope | Transaction History Telemetry',
           seoDescription: 'Monitor real-time Soroban contract events, transaction fees, and telemetry records.',
+        };
+      case 'disassembly':
+        return {
+          pageTitle: 'SoroScope | WASM Disassembly Viewer',
+          seoDescription: 'Decode Soroban contract WASM bytecode and cross-highlight opcodes against the Rust source.',
         };
       case 'history':
         return {
@@ -415,6 +427,13 @@ export default function Home() {
             </ErrorBoundary>
           </div>
 
+          {/* Side-by-side Rust/WASM panes need the full content width. */}
+          {tab === 'disassembly' && (
+            <section className="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
+              <WasmDisassemblyViewer wasmFile={wasmFile} />
+            </section>
+          )}
+
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             <div className="space-y-4">
           {/* Gas Golfing Suggestions Table */}
@@ -497,6 +516,16 @@ export default function Home() {
                   onChange={(e) => setContractId(e.target.value)}
                   className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
                 />
+                <div className="mt-2 flex items-center gap-3 text-xs">
+                  <ContractAddressLink
+                    value={contractId}
+                    kind="contract"
+                    label={null}
+                    className="text-xs"
+                  />
+                  <span className="text-slate-600">&middot;</span>
+                  <span className="text-slate-500">opens on the active network explorer</span>
+                </div>
               </div>
               <ContractInteraction
                 selectedFunction={selectedFunction}
@@ -568,6 +597,8 @@ export default function Home() {
                 )
               ) : tab === 'schema' ? (
                 <SchemaVisualizer report={analysisReport} />
+              ) : tab === 'disassembly' ? (
+                <p className="py-8 text-center text-slate-500">Disassembly is shown above.</p>
               ) : tab === 'transactions' ? (
                 <TransactionHistoryTable transactions={mockTransactions} />
               ) : tab === 'analytics' ? (
@@ -678,13 +709,10 @@ export default function Home() {
         <TransactionConfetti />
       {/* Wallet Modal */}
       <WalletModal />
-      {toastNotification && (
-        <Toast
-          message={toastNotification.message}
-          type={toastNotification.type}
-          onClose={() => setToastNotification(null)}
-        />
-      )}
+      <ToastStack
+        toasts={toastNotifications}
+        onClose={(id) => setToastNotifications((current) => dismissToast(current, id))}
+      />
     </>
   );
 }
